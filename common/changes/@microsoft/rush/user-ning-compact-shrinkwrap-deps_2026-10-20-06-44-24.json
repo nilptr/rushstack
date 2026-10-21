@@ -1,0 +1,10 @@
+{
+  "changes": [
+    {
+      "comment": "shrinkwrap-deps.json now records one aggregate digest per workspace link: dependency instead of merging the linked project's entries, keeping transitive change detection while restoring file sizes.",
+      "type": "patch",
+      "packageName": "@microsoft/rush"
+    }
+  ],
+  "packageName": "@microsoft/rush"
+}

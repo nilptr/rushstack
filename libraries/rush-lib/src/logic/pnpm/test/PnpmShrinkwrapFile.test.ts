@@ -11,6 +11,18 @@ import { PnpmOptionsConfiguration } from '../PnpmOptionsConfiguration';
 import { AlreadyReportedError } from '@rushstack/node-core-library';
 
 const DEPENDENCY_NAME: string = 'dependency_name';
+
+/**
+ * Asserts that the integrity map summarizes a workspace `link:` dependency with exactly one entry whose
+ * value has the `${importerKey}:${sha256Base64}:` shape, and returns that value.
+ */
+function expectAggregateEntry(integrityMap: Map<string, string>, importerKey: string): string {
+  const value: string | undefined = integrityMap.get(importerKey);
+  expect(value).toBeDefined();
+  expect(value!.startsWith(`${importerKey}:`)).toBe(true);
+  expect(value!.slice(importerKey.length)).toMatch(/^:[A-Za-z0-9+/]{43}=:$/);
+  return value!;
+}
 const SCOPED_DEPENDENCY_NAME: string = '@scope/dependency_name';
 const VERSION: string = '1.4.0';
 const PRERELEASE_VERSION: string = '1.4.0-prerelease.0';
@@ -369,10 +381,10 @@ snapshots:
       expect(fooIntegrity1).not.toEqual(fooIntegrity2);
     });
 
-    it('includes workspace-local link: dependencies by recursing into their importer entries', () => {
-      // This test verifies that link: (workspace-local) dependencies are no longer filtered out.
-      // The shrinkwrap-deps.json for an importer should include hashes from its workspace
-      // dependencies' importer sections, all the way down the tree.
+    it('summarizes workspace-local link: dependencies with a single aggregate entry', () => {
+      // This test verifies that link: (workspace-local) dependencies are not filtered out, but are also
+      // not merged entry-by-entry: the shrinkwrap-deps.json for an importer contains exactly one entry per
+      // workspace dependency, whose value digests that dependency's entire transitive dependency state.
       //
       // In a real Rush repo (no subspaces), importer keys start with '../../' and
       // link: paths start with '../'.
@@ -415,17 +427,22 @@ snapshots:
 
       expect(proj1IntegrityMap).toBeDefined();
 
-      // project-1's integrity map should include project-2's importer entry
-      expect(proj1IntegrityMap!.has('../../project-2')).toBe(true);
+      // project-1's integrity map should include exactly one aggregate entry for project-2
+      expectAggregateEntry(proj1IntegrityMap!, '../../project-2');
 
-      // It should also include the transitive external dependency of project-2
-      expect(proj1IntegrityMap!.has('lodash@4.17.21')).toBe(true);
+      // project-2's external dependencies are folded into that digest rather than merged as entries
+      expect(proj1IntegrityMap!.has('lodash@4.17.21')).toBe(false);
+      expect(Array.from(proj1IntegrityMap!.keys()).sort()).toEqual(['../../project-1', '../../project-2']);
 
-      // The integrity map for project-2 itself should also be populated
+      // The integrity map for project-2 itself keeps the plain shape: its own entry plus its external packages
       const proj2IntegrityMap = shrinkwrapFile.getIntegrityForImporter('../../project-2');
       expect(proj2IntegrityMap).toBeDefined();
       expect(proj2IntegrityMap!.has('../../project-2')).toBe(true);
       expect(proj2IntegrityMap!.has('lodash@4.17.21')).toBe(true);
+      // The aggregate differs from project-2's own self-integrity, since it also covers lodash
+      expect(proj1IntegrityMap!.get('../../project-2')).not.toEqual(
+        proj2IntegrityMap!.get('../../project-2')
+      );
     });
 
     it('produces different hashes when a workspace-local dependency changes', () => {
@@ -477,18 +494,146 @@ snapshots:
 
       // The self-hash of project-1 does NOT change because the root importer object itself is
       // identical in both cases (it still references link:../project-2). However, project-2's
-      // integrity hash should differ because its lodash dependency resolved to a different version.
-      const proj2Integrity1 = proj1IntegrityMap1!.get('../../project-2');
-      const proj2Integrity2 = proj1IntegrityMap2!.get('../../project-2');
+      // aggregate entry should differ because its lodash dependency resolved to a different version.
+      expect(proj1IntegrityMap1!.get('../../project-1')).toEqual(proj1IntegrityMap2!.get('../../project-1'));
 
-      expect(proj2Integrity1).toBeDefined();
-      expect(proj2Integrity2).toBeDefined();
+      const proj2Integrity1 = expectAggregateEntry(proj1IntegrityMap1!, '../../project-2');
+      const proj2Integrity2 = expectAggregateEntry(proj1IntegrityMap2!, '../../project-2');
       expect(proj2Integrity1).not.toEqual(proj2Integrity2);
+    });
+
+    it('changes the aggregate entry when a dependency deeper in the link: chain changes', () => {
+      // Topology: project-1 -> (link:) project-2 -> (link:) project-3 -> lodash@4.17.x (version differs)
+      //
+      // project-1 only links to project-2, but project-2's aggregate must cover project-3 and lodash too.
+
+      const buildContent = (lodashVersion: string): string => `
+lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+importers:
+  .:
+    {}
+  ../../project-1:
+    dependencies:
+      project-2:
+        specifier: workspace:*
+        version: link:../project-2
+  ../../project-2:
+    dependencies:
+      project-3:
+        specifier: workspace:*
+        version: link:../project-3
+  ../../project-3:
+    dependencies:
+      lodash:
+        specifier: ^4.17.0
+        version: ${lodashVersion}
+packages:
+  lodash@${lodashVersion}:
+    resolution:
+      integrity: sha512-lodash-${lodashVersion}==
+snapshots:
+  lodash@${lodashVersion}: {}
+`;
+
+      const shrinkwrapFile1 = PnpmShrinkwrapFile.loadFromString(buildContent('4.17.21'), {
+        subspaceHasNoProjects: false
+      });
+      const shrinkwrapFile2 = PnpmShrinkwrapFile.loadFromString(buildContent('4.17.20'), {
+        subspaceHasNoProjects: false
+      });
+
+      PnpmShrinkwrapFile.clearCache();
+
+      const proj1IntegrityMap1 = shrinkwrapFile1.getIntegrityForImporter('../../project-1')!;
+      const proj1IntegrityMap2 = shrinkwrapFile2.getIntegrityForImporter('../../project-1')!;
+
+      // Only the aggregate entry for project-2 is present; nothing from deeper in the chain is merged
+      expect(Array.from(proj1IntegrityMap1.keys()).sort()).toEqual(['../../project-1', '../../project-2']);
+      expect(proj1IntegrityMap1.get('../../project-1')).toEqual(proj1IntegrityMap2.get('../../project-1'));
+      expect(expectAggregateEntry(proj1IntegrityMap1, '../../project-2')).not.toEqual(
+        expectAggregateEntry(proj1IntegrityMap2, '../../project-2')
+      );
+    });
+
+    it('produces identical maps regardless of traversal order when workspace projects form a cycle', () => {
+      // Rush allows workspace cycles via "decoupledLocalDependencies".
+      // Topology: project-a -> (link:) project-b -> (link:) project-a, each with one external dependency.
+
+      const shrinkwrapContent: string = `
+lockfileVersion: '9.0'
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+importers:
+  .:
+    {}
+  ../../project-a:
+    dependencies:
+      ext-a:
+        specifier: ^1.0.0
+        version: 1.0.0
+      project-b:
+        specifier: workspace:*
+        version: link:../project-b
+  ../../project-b:
+    dependencies:
+      ext-b:
+        specifier: ^2.0.0
+        version: 2.0.0
+      project-a:
+        specifier: workspace:*
+        version: link:../project-a
+packages:
+  ext-a@1.0.0:
+    resolution:
+      integrity: sha512-ext-a==
+  ext-b@2.0.0:
+    resolution:
+      integrity: sha512-ext-b==
+snapshots:
+  ext-a@1.0.0: {}
+  ext-b@2.0.0: {}
+`;
+
+      const sortedEntries = (map: Map<string, string> | undefined): [string, string][] =>
+        Array.from(map!.entries()).sort(([a], [b]) => a.localeCompare(b));
+
+      // First instance: compute project-a before project-b
+      PnpmShrinkwrapFile.clearCache();
+      const shrinkwrapFileAB = PnpmShrinkwrapFile.loadFromString(shrinkwrapContent, {
+        subspaceHasNoProjects: false
+      });
+      const mapA1 = sortedEntries(shrinkwrapFileAB.getIntegrityForImporter('../../project-a'));
+      const mapB1 = sortedEntries(shrinkwrapFileAB.getIntegrityForImporter('../../project-b'));
+
+      // Second (fresh) instance: compute project-b before project-a
+      PnpmShrinkwrapFile.clearCache();
+      const shrinkwrapFileBA = PnpmShrinkwrapFile.loadFromString(shrinkwrapContent, {
+        subspaceHasNoProjects: false
+      });
+      expect(shrinkwrapFileBA).not.toBe(shrinkwrapFileAB);
+      const mapB2 = sortedEntries(shrinkwrapFileBA.getIntegrityForImporter('../../project-b'));
+      const mapA2 = sortedEntries(shrinkwrapFileBA.getIntegrityForImporter('../../project-a'));
+
+      PnpmShrinkwrapFile.clearCache();
+
+      expect(mapA1).toEqual(mapA2);
+      expect(mapB1).toEqual(mapB2);
+
+      // Each project keeps its own entries and summarizes the other with one aggregate entry
+      expect(mapA1.map(([key]) => key)).toEqual(['../../project-a', '../../project-b', 'ext-a@1.0.0']);
+      expect(mapB1.map(([key]) => key)).toEqual(['../../project-a', '../../project-b', 'ext-b@2.0.0']);
+      expectAggregateEntry(new Map(mapA1), '../../project-b');
+      expectAggregateEntry(new Map(mapB1), '../../project-a');
     });
 
     it('scenario 1: workspace project 1 -> workspace project 2 -> external dep 1 -> external dep 2', () => {
       // Tests the full chain: project-1 links to project-2, project-2 depends on ext-a,
-      // and ext-a transitively depends on ext-b. All four should appear in project-1's integrity map.
+      // and ext-a transitively depends on ext-b. project-1's integrity map summarizes project-2 (and
+      // therefore ext-a and ext-b) with a single aggregate entry; project-2's own map lists them all.
 
       const shrinkwrapContent: string = `
 lockfileVersion: '9.0'
@@ -531,22 +676,29 @@ snapshots:
       const proj1IntegrityMap = shrinkwrapFile.getIntegrityForImporter('../../project-1');
 
       expect(proj1IntegrityMap).toBeDefined();
-      // project-2's importer entry
-      expect(proj1IntegrityMap!.has('../../project-2')).toBe(true);
-      // ext-a (direct dep of project-2)
-      expect(proj1IntegrityMap!.has('ext-a@1.0.0')).toBe(true);
-      // ext-b (transitive dep through ext-a)
-      expect(proj1IntegrityMap!.has('ext-b@1.0.0')).toBe(true);
+      // project-2's aggregate entry
+      expectAggregateEntry(proj1IntegrityMap!, '../../project-2');
+      // ext-a (direct dep of project-2) and ext-b (transitive dep through ext-a) are covered by the
+      // aggregate rather than merged into project-1's map
+      expect(proj1IntegrityMap!.has('ext-a@1.0.0')).toBe(false);
+      expect(proj1IntegrityMap!.has('ext-b@1.0.0')).toBe(false);
+
+      const proj2IntegrityMap = shrinkwrapFile.getIntegrityForImporter('../../project-2');
+      expect(Array.from(proj2IntegrityMap!.keys()).sort()).toEqual([
+        '../../project-2',
+        'ext-a@1.0.0',
+        'ext-b@1.0.0'
+      ]);
     });
 
     it('scenario 2: workspace project 1 -> external dep 1 -> (link:) workspace project 2 -> external dep 2', () => {
       // Tests that when an external package's snapshot has a link: dependency pointing back into
-      // the workspace, the linked workspace project's integrity is fully captured.
+      // the workspace, the linked workspace project's integrity is captured by an aggregate entry.
       //
       // project-1 depends on ext-a (external).
       // ext-a's snapshot has a link: dep that resolves to project-2 (a workspace project).
       // project-2 depends on ext-b (external).
-      // All four entries should appear in project-1's integrity map.
+      // project-1's integrity map should contain itself, ext-a, and an aggregate entry for project-2.
 
       const shrinkwrapContent: string = `
 lockfileVersion: '9.0'
@@ -592,9 +744,14 @@ snapshots:
       // ext-a (direct external dep of project-1)
       expect(proj1IntegrityMap!.has('ext-a@1.0.0')).toBe(true);
       // project-2 (workspace project, reached via link: in ext-a's snapshot)
-      expect(proj1IntegrityMap!.has('../../project-2')).toBe(true);
-      // ext-b (external dep of project-2, reached transitively through the link:)
-      expect(proj1IntegrityMap!.has('ext-b@2.0.0')).toBe(true);
+      expectAggregateEntry(proj1IntegrityMap!, '../../project-2');
+      // ext-b (external dep of project-2) is covered by project-2's aggregate entry, not merged
+      expect(proj1IntegrityMap!.has('ext-b@2.0.0')).toBe(false);
+      expect(Array.from(proj1IntegrityMap!.keys()).sort()).toEqual([
+        '../../project-1',
+        '../../project-2',
+        'ext-a@1.0.0'
+      ]);
     });
   });
 
